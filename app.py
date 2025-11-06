@@ -121,6 +121,70 @@ def wrap_text(text: str,bold: bool =False):
                }
             }
 
+# 关键词搜索
+def search_pages(keyword: str = "", obj_type: str = "page", limit: int = 10):
+    conn = http.client.HTTPSConnection("api.notion.com")
+    payload = json.dumps({
+        "query": keyword,
+        "object": obj_type,
+        "sort": {"timestamp": "last_edited_time", "direction": "descending"},
+        "page_size": limit
+    })
+    headers = {
+        "Authorization": os.getenv("NOTION_API_KEY"),
+        "Notion-Version": os.getenv("Notion-Version", "2022-06-28"),
+        "Content-Type": "application/json"
+    }
+    conn.request("POST", "/v1/search", payload, headers)
+    res = conn.getresponse()
+    data = json.loads(res.read().decode())
+    results = []
+    for item in data.get("results", []):
+        title = ""
+        if item["object"] == "page":
+            title = item["properties"].get("Name", {}).get("title", [{}])[0].get("plain_text", "")
+        elif item["object"] == "database":
+            title = item["title"][0]["plain_text"] if item["title"] else ""
+        results.append({
+            "id": item["id"],
+            "title": title,
+            "type": item["object"],
+            "last_edited_time": item["last_edited_time"]
+        })
+    return results
+ 
+# 拉取页面属性
+
+def get_page_properties(page_id: str):
+    conn = http.client.HTTPSConnection("api.notion.com")
+    headers = {
+        "Authorization": os.getenv("NOTION_API_KEY"),
+        "Notion-Version": os.getenv("Notion-Version", "2022-06-28")
+    }
+    conn.request("GET", f"/v1/pages/{page_id}", "", headers)
+    res = conn.getresponse()
+    return json.loads(res.read().decode())
+ 
+
+# 拿页面/块100条正文内容
+
+def get_blocks(block_id: str, recursive: bool = False):
+    """recursive=True 时自动再抓子块"""
+    conn = http.client.HTTPSConnection("api.notion.com")
+    headers = {
+        "Authorization": os.getenv("NOTION_API_KEY"),
+        "Notion-Version": os.getenv("Notion-Version", "2022-06-28")
+    }
+    conn.request("GET", f"/v1/blocks/{block_id}/children?page_size=100", "", headers)
+    res = conn.getresponse()
+    blocks = json.loads(res.read().decode()).get("results", [])
+    if recursive:
+        for b in blocks:
+            if b.get("has_children"):
+                b["children"] = get_blocks(b["id"], recursive=True)
+    return blocks
+ 
+
 
 if __name__ == "__main__":
 

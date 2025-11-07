@@ -2,12 +2,18 @@ import json
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
-from app import (
+from tools import (
     get_lasted_change_page_id,
-    get_page_content,
     wrap_url,
     wrap_text,
-    change_block
+    change_block,
+    search_pages,
+    get_page_properties,
+    get_blocks,
+    clear_rich_text,
+    append_text,
+    append_page_mention,
+    finish_rich_text
 )
 
 # 加载环境变量
@@ -41,8 +47,38 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "get_page_content",
-            "description": "获取指定 Notion 页面的所有子 block 内容",
+            "name": "search_pages",
+            "description": "根据关键词搜索 Notion 中的页面或数据库，返回包含标题、ID、类型和最后编辑时间的结果列表。支持模糊搜索和精确匹配。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "搜索关键词。如果为空字符串 ''，则返回所有页面（按最后编辑时间排序）。支持页面标题的模糊匹配。"
+                    },
+                    "obj_type": {
+                        "type": "string",
+                        "description": "要搜索的对象类型。'page' 表示页面，'database' 表示数据库。默认为 'page'。",
+                        "enum": ["page", "database"],
+                        "default": "page"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "返回的结果数量上限，范围 1-100。默认为 10。",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 10
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_page_properties",
+            "description": "获取指定 Notion 页面的详细属性信息，包括标题、属性、创建时间等",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -58,38 +94,71 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "wrap_url",
-            "description": "将 Notion 页面 ID 包装成 mention 格式，用于在 rich_text 中引用页面",
+            "name": "get_blocks",
+            "description": "获取指定页面或块的子块内容（最多 100 条），可选择是否递归获取所有嵌套子块",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "id": {
+                    "block_id": {
                         "type": "string",
-                        "description": "Notion 页面的 ID"
+                        "description": "Notion 块或页面的 ID"
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "是否递归获取所有嵌套的子块，默认为 false"
                     }
                 },
-                "required": ["id"]
+                "required": ["block_id"]
             }
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "wrap_text",
-            "description": "将文本包装成 Notion rich_text 格式，支持粗体等样式",
+            "name": "append_text",
+            "description": "添加文本内容到 rich_text 缓冲区。必须按照最终在 Notion 中显示的顺序依次调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "要包装的文本内容"
+                        "description": "文本内容，使用 \\n 表示换行"
                     },
                     "bold": {
                         "type": "boolean",
-                        "description": "是否加粗，默认为 false"
+                        "description": "是否加粗显示，默认为 false"
                     }
                 },
                 "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_page_mention",
+            "description": "添加页面引用（mention）到 rich_text 缓冲区。页面引用会在 Notion 中显示为可点击的页面链接。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "要引用的 Notion 页面 ID"
+                    }
+                },
+                "required": ["page_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_rich_text",
+            "description": "完成 rich_text 构建并返回完整列表。在添加完所有内容元素后，必须调用此函数来完成构建过程。这是最后一步。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         }
     }
@@ -98,13 +167,16 @@ tools = [
 # 函数映射
 available_functions = {
     "get_lasted_change_page_id": get_lasted_change_page_id,
-    "get_page_content": get_page_content,
-    "wrap_url": wrap_url,
-    "wrap_text": wrap_text,
+    "search_pages": search_pages,
+    "get_page_properties": get_page_properties,
+    "get_blocks": get_blocks,
+    "append_text": append_text,
+    "append_page_mention": append_page_mention,
+    "finish_rich_text": finish_rich_text,
 }
 
 
-def run_agent(user_prompt: str, max_iterations: int = 10):
+def run_agent(user_prompt: str, max_iterations: int = 50):
     """
     运行智能体，根据用户提示生成 rich_text
 
@@ -115,46 +187,105 @@ def run_agent(user_prompt: str, max_iterations: int = 10):
     Returns:
         生成的 rich_text 列表
     """
+    # 自动清空缓冲区，开始新的构建
+    clear_rich_text()
+
     messages = [
         {
             "role": "system",
-            "content": """你是一个 Notion 助手，可以帮助用户生成 Notion rich_text 格式的内容。
+            "content": """你是一个 Notion 助手。你的职责是根据用户的问题，收集信息并构建 rich_text 格式的回答，最终显示在 Notion block 中。
 
-你可以使用以下工具：
-1. get_lasted_change_page_id - 获取最近修改的页面
-2. get_page_content - 获取页面内容
-3. wrap_url - 将页面 ID 包装成 mention 格式
-4. wrap_text - 将文本包装成 rich_text 格式
+## 可用工具
 
-你的任务是根据用户需求，调用这些工具，最终生成一个 rich_text 列表。
+**【数据获取工具】**
+1. `search_pages(keyword, obj_type, limit)` - 搜索 Notion 页面或数据库
+   - keyword: 搜索关键词，空字符串 '' 返回所有页面
+   - obj_type: 'page' 或 'database'
+   - limit: 返回数量（1-100）
 
-rich_text 格式示例：
-[
-  {
-    "type": "text",
-    "text": { "content": "前面文本\\n" },
-    "annotations": { "bold": true }
-  },
-  {
-    "type": "mention",
-    "mention": {
-      "type": "page",
-      "page": { "id": "2a319740-7c23-8004-b792-f09b1c282df0" }
-    }
-  },
-  {
-    "type": "text",
-    "text": { "content": "\\n后面文本" }
-  }
-]
+2. `get_lasted_change_page_id(page_size)` - 获取最近修改的页面 ID 列表
 
-工作流程：
-1. 先调用 get_lasted_change_page_id 或 get_page_content 获取数据
-2. 然后使用 wrap_text 和 wrap_url 按顺序构建每个元素
-3. 确保所有的 wrap_* 调用按照最终显示顺序进行
-4. 换行使用 \\n，粗体文本设置 bold=true
+3. `get_page_properties(page_id)` - 获取页面的详细属性（标题、属性、创建时间等）
 
-重要：你必须使用工具函数来构建每个元素，不要直接返回 JSON！"""
+4. `get_blocks(block_id, recursive)` - 获取页面或块的内容
+   - block_id: 页面或块 ID
+   - recursive: 是否递归获取子块（true/false）
+
+**【内容构建工具】**
+5. `append_text(text, bold)` - 添加文本内容
+   - text: 文本内容，使用 \\n 表示换行
+   - bold: 是否加粗（true/false）
+
+6. `append_page_mention(page_id)` - 添加页面引用链接
+   - page_id: 要引用的页面 ID
+
+7. `finish_rich_text()` - **完成构建，返回最终结果**（必须是最后一步）
+
+## 工作流程（严格遵守）
+
+**阶段 1：数据收集**
+- 根据用户问题，使用数据获取工具收集必要信息
+- 可能需要多次调用不同工具来获取完整信息
+
+**阶段 2：内容构建（核心）**
+按照最终在 Notion 中的显示顺序，依次调用 append_* 函数：
+1. 使用 `append_text()` 添加标题、描述、说明文字
+2. 使用 `append_page_mention()` 添加页面引用
+3. 使用 `append_text()` 添加换行符、分隔符、后续文字
+4. 重复以上步骤，直到所有内容添加完毕
+
+**阶段 3：完成构建**
+- 确认所有内容已添加后，调用 `finish_rich_text()`
+- 这是最后一步，调用后任务完成
+
+## 示例工作流
+
+**用户问题：**"显示最近修改的 3 个页面"
+
+**执行步骤：**
+```
+1. get_lasted_change_page_id(3)  → 获取 [id1, id2, id3]
+
+2. append_text("最近修改的页面：\\n\\n", bold=true)  → 添加标题
+
+3. append_text("• ", bold=false)  → 添加列表标记
+4. append_page_mention(id1)       → 添加第1个页面引用
+5. append_text("\\n", bold=false) → 换行
+
+6. append_text("• ", bold=false)  → 添加列表标记
+7. append_page_mention(id2)       → 添加第2个页面引用
+8. append_text("\\n", bold=false) → 换行
+
+9. append_text("• ", bold=false)  → 添加列表标记
+10. append_page_mention(id3)      → 添加第3个页面引用
+11. append_text("\\n", bold=false) → 换行
+
+12. finish_rich_text()            → 完成构建
+```
+
+## 关键规则
+
+**必须遵守：**
+1. ✅ **永远不要直接返回文本给用户** - 必须使用 append_* 工具构建
+2. ✅ **按显示顺序调用** - 从上到下、从左到右依次添加内容
+3. ✅ **内容要完整** - 不要只添加标题就结束，要添加完整的回答
+4. ✅ **最后必须调用 finish_rich_text()** - 否则内容不会返回
+5. ✅ **使用 \\n 换行** - 使用 \\n\\n 创建段落间距
+
+**格式建议：**
+- 标题和重点内容使用 `bold=true`
+- 列表项使用 `• ` 或 `1. ` 等标记
+- 页面引用后通常需要换行
+- 内容要清晰、结构化，方便阅读
+- 如果回答是基于最近修改的页面或搜索结果，务必引用具体页面
+
+**常见错误（避免）：**
+❌ 只调用一次 append_text 就调用 finish_rich_text
+❌ 调用 finish_rich_text 后继续添加内容
+❌ 不调用 finish_rich_text 就结束
+❌ 直接返回文本内容而不使用工具
+
+记住：你的目标是构建一个**完整、格式美观**的 rich_text 列表，确保用户能在 Notion 中获得高质量的回答！"""
         },
         {
             "role": "user",
@@ -163,7 +294,7 @@ rich_text 格式示例：
     ]
 
     iteration = 0
-    rich_text_result = []
+    rich_text_result = None
 
     while iteration < max_iterations:
         iteration += 1
@@ -185,22 +316,7 @@ rich_text 格式示例：
 
         if not tool_calls:
             # 没有工具调用，说明已完成
-            print("智能体完成，返回结果")
-            final_content = response_message.content
-
-            # 尝试从响应中提取 rich_text
-            if final_content:
-                print(f"最终响应: {final_content}")
-                # 如果响应包含 JSON，尝试解析
-                try:
-                    # 查找 JSON 数组
-                    import re
-                    json_match = re.search(r'\[.*\]', final_content, re.DOTALL)
-                    if json_match:
-                        rich_text_result = json.loads(json_match.group())
-                except:
-                    pass
-
+            print("智能体完成")
             break
 
         # 执行工具调用
@@ -233,9 +349,10 @@ rich_text 格式示例：
                         "content": function_response_str
                     })
 
-                    # 如果是 wrap_* 函数，收集结果
-                    if function_name in ["wrap_url", "wrap_text"]:
-                        rich_text_result.append(function_response)
+                    # 如果是 finish_rich_text，提取最终的 rich_text
+                    if function_name == "finish_rich_text" and isinstance(function_response, dict):
+                        rich_text_result = function_response.get("rich_text", [])
+                        print(f"\n✓ Rich text 构建完成，共 {len(rich_text_result)} 个元素")
 
                 except Exception as e:
                     print(f"函数调用错误: {e}")
@@ -274,14 +391,45 @@ def generate_rich_text(prompt: str):
     return rich_text
 
 
-if __name__ == "__main__":
-    # 示例：让智能体生成包含最近修改页面的 rich_text
-    prompt = """
-    请帮我生成一个 rich_text，内容如下：
-    1. 先显示粗体文本 "最近修改的页面："
-    2. 获取最近 5 个修改的页面
-    3. 为每个页面创建一个换行，然后显示页面的 mention 链接
-    4. 最后显示文本 "以上是最近的更新"
+def ask_question(question: str):
     """
+    向智能体提问，自动搜索相关信息并生成 rich_text 格式的回答
 
-    generate_rich_text(prompt)
+    Args:
+        question: 用户的问题
+
+    Returns:
+        生成的 rich_text 列表
+    """
+    print(f"问题: {question}\n")
+
+    # 运行智能体
+    rich_text = run_agent(question)
+
+    if rich_text:
+        print("\n=== 生成的回答（Rich Text） ===")
+        print(json.dumps(rich_text, indent=2, ensure_ascii=False))
+
+        # 更新 Notion block
+        print("\n=== 更新到 Notion Block ===")
+        change_block(rich_text)
+        print("✓ 回答已更新到 Notion")
+    else:
+        print("未能生成回答")
+
+    return rich_text
+
+
+if __name__ == "__main__":
+    # 示例 1：生成包含最近修改页面的 rich_text
+    # prompt = """
+    # 请帮���生成一个 rich_text，内容如下：
+    # 1. 先显示粗体文本 "最近修改的页面："
+    # 2. 获取最近 5 个修改的页面
+    # 3. 为每个页面创建一个换行，然后显示页面的 mention 链接
+    # 4. 最后显示文本 "以上是最近的更新"
+    # """
+    # generate_rich_text(prompt)
+
+    # 示例 2：向智能体提问
+    ask_question("根据用户最近修改的内容以及页面，说一下最近更新，并给出用户接下来的建议，简短一点，建议不要太宽泛，要根据实际内容基于编辑修改或者拓展的建议，给出三到五个页面的结果")

@@ -28,6 +28,12 @@ def change_block(rich_text:list):
          "rich_text": rich_text
       }
    })
+
+   # 调试：打印发送的 payload
+   print("\n=== 发送到 Notion 的 Payload ===")
+   print(f"Rich text 元素数量: {len(rich_text)}")
+   print(f"Payload 前 500 字符: {payload[:500]}...")
+
    headers = {
       'Authorization': os.getenv("NOTION_API_KEY"),
       'Notion-Version': os.getenv("Notion-Version"),
@@ -39,6 +45,8 @@ def change_block(rich_text:list):
    conn.request("PATCH", blocks_url, payload, headers)
    res = conn.getresponse()
    data = res.read().decode("utf-8")
+
+   print("\n=== Notion API 响应 ===")
    print(data)
 
 # 查询 页面内容
@@ -124,12 +132,23 @@ def wrap_text(text: str,bold: bool =False):
 # 关键词搜索
 def search_pages(keyword: str = "", obj_type: str = "page", limit: int = 10):
     conn = http.client.HTTPSConnection("api.notion.com")
-    payload = json.dumps({
-        "query": keyword,
-        "object": obj_type,
+    
+    # 构建请求 payload
+    payload_dict = {
         "sort": {"timestamp": "last_edited_time", "direction": "descending"},
         "page_size": limit
-    })
+    }
+    
+    # 只有当 keyword 不为空时才添加 query
+    if keyword:
+        payload_dict["query"] = keyword
+    
+    # 添加 filter 来指定对象类型
+    if obj_type:
+        payload_dict["filter"] = {"value": obj_type, "property": "object"}
+    
+    payload = json.dumps(payload_dict)
+    
     headers = {
         "Authorization": os.getenv("NOTION_API_KEY"),
         "Notion-Version": os.getenv("Notion-Version", "2022-06-28"),
@@ -138,19 +157,28 @@ def search_pages(keyword: str = "", obj_type: str = "page", limit: int = 10):
     conn.request("POST", "/v1/search", payload, headers)
     res = conn.getresponse()
     data = json.loads(res.read().decode())
+    
     results = []
     for item in data.get("results", []):
         title = ""
         if item["object"] == "page":
-            title = item["properties"].get("Name", {}).get("title", [{}])[0].get("plain_text", "")
+            # 页面的标题在 properties.title.title 数组中
+            title_array = item.get("properties", {}).get("title", {}).get("title", [])
+            if title_array:
+                title = title_array[0].get("plain_text", "")
         elif item["object"] == "database":
-            title = item["title"][0]["plain_text"] if item["title"] else ""
+            # 数据库的标题直接在 title 数组中
+            title_array = item.get("title", [])
+            if title_array:
+                title = title_array[0].get("plain_text", "")
+        
         results.append({
             "id": item["id"],
             "title": title,
             "type": item["object"],
             "last_edited_time": item["last_edited_time"]
         })
+    
     return results
  
 # 拉取页面属性
@@ -183,16 +211,126 @@ def get_blocks(block_id: str, recursive: bool = False):
             if b.get("has_children"):
                 b["children"] = get_blocks(b["id"], recursive=True)
     return blocks
- 
+
+
+# ==================== Rich Text 构建工具 ====================
+# 全局变量：临时存储正在构建的 rich_text 列表
+_rich_text_buffer = []
+
+
+def clear_rich_text():
+    """清空 rich_text 缓冲区（内部使用，不暴露给 LLM）"""
+    global _rich_text_buffer
+    _rich_text_buffer = []
+
+
+def append_text(text: str, bold: bool = False):
+    """
+    直接添加文本到 rich_text 缓冲区
+
+    Args:
+        text: 文本内容
+        bold: 是否加粗，默认为 False
+
+    Returns:
+        操作状态信息
+    """
+    global _rich_text_buffer
+    element = {
+        "type": "text",
+        "text": {
+            "content": text
+        },
+        "annotations": {
+            "bold": bold
+        }
+    }
+    _rich_text_buffer.append(element)
+    return {
+        "status": "success",
+        "message": f"Text added. Buffer now has {len(_rich_text_buffer)} elements",
+        "current_count": len(_rich_text_buffer)
+    }
+
+
+def append_page_mention(page_id: str):
+    """
+    直接添加页面引用到 rich_text 缓冲区
+
+    Args:
+        page_id: Notion 页面的 ID
+
+    Returns:
+        操作状态信息
+    """
+    global _rich_text_buffer
+    element = {
+        "type": "mention",
+        "mention": {
+            "type": "page",
+            "page": {
+                "id": page_id
+            }
+        }
+    }
+    _rich_text_buffer.append(element)
+    return {
+        "status": "success",
+        "message": f"Page mention added. Buffer now has {len(_rich_text_buffer)} elements",
+        "current_count": len(_rich_text_buffer)
+    }
+
+
+def finish_rich_text():
+    """
+    完成 rich_text 构建，返回完整列表
+
+    Returns:
+        完整的 rich_text 列表
+    """
+    global _rich_text_buffer
+    result = _rich_text_buffer.copy()
+    return {
+        "status": "finished",
+        "message": f"Rich text construction finished with {len(result)} elements",
+        "element_count": len(result),
+        "rich_text": result
+    }
+
+
+def get_rich_text_buffer():
+    """获取当前缓冲区内容（用于调试）"""
+    global _rich_text_buffer
+    return {
+        "count": len(_rich_text_buffer),
+        "buffer": _rich_text_buffer
+    }
 
 
 if __name__ == "__main__":
+   # 示例 1：生成包含最近修改页面的 rich_text
+   # prompt = """
+   # 请帮我生成一个 rich_text，内容如下：
+   # 1. 先显示粗体文本 "最近修改的页面："
+   # 2. 获取最近 5 个修改的页面
+   # 3. 为每个页面创建一个换行，然后显示页面的 mention 链接
+   # 4. 最后显示文本 "以上是最近的更新"
+   # """
+   # generate_rich_text(prompt)
 
-   url=get_lasted_change_page_id(10)
+   # 示例 2：向智能体提问
+
+   # 测试搜索功能 - 注意参数顺序：keyword, obj_type, limit
+   a = search_pages('', 'page', 10)
+   print("搜索结果:")
+   print(a)
+
+
+   url = get_lasted_change_page_id(10)
    print("获取到最近修改的页面 ID:")
    print(url)
 
-   rich_text=[
+   rich_text = [
       wrap_text("前面的文本哈哈哈\n", True),
       wrap_text("第一处修改", False),
       wrap_url(url[0]),
